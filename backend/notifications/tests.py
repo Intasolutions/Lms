@@ -1,0 +1,813 @@
+from django.test import TestCase
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from django.urls import reverse
+from rest_framework.test import APITestCase
+from rest_framework import status
+from datetime import timedelta
+from courses.models import Course, Enrollment, Module, VideoLesson, LessonProgress
+from orders.models import Purchase
+from django.db import IntegrityError
+from .models import Notification, Announcement, NotificationType, DeviceToken
+from .services import NotificationService
+
+User = get_user_model()
+
+class NotificationModelTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="testuser", password="password123")
+        self.user2 = User.objects.create_user(username="anotheruser", password="password123")
+        self.course = Course.objects.create(title="Test Course", price=10.00, is_published=True)
+
+    def test_notification_creation_and_attributes(self):
+        # 1. Notification can be created.
+        notification = Notification.objects.create(
+            recipient=self.user,
+            title="Welcome",
+            body="Welcome to the LMS!",
+            notification_type="ANNOUNCEMENT",
+            action_url="http://example.com"
+        )
+        self.assertEqual(notification.title, "Welcome")
+        self.assertEqual(notification.body, "Welcome to the LMS!")
+        self.assertEqual(notification.notification_type, "ANNOUNCEMENT")
+        self.assertEqual(notification.action_url, "http://example.com")
+
+        # 2. Notification defaults to unread.
+        self.assertFalse(notification.is_read)
+
+        # 3. read_at can be null.
+        self.assertIsNone(notification.read_at)
+
+        # 4. Notification belongs to the correct user.
+        self.assertEqual(notification.recipient, self.user)
+        self.assertIn(notification, self.user.notifications.all())
+        self.assertNotIn(notification, self.user2.notifications.all())
+
+    def test_global_and_course_specific_announcements(self):
+        # 5. Global Announcement can have course=NULL.
+        global_announcement = Announcement.objects.create(
+            sender=self.user,
+            course=None,
+            title="Global News",
+            content="This is site-wide.",
+            is_published=True
+        )
+        self.assertEqual(global_announcement.title, "Global News")
+        self.assertIsNone(global_announcement.course)
+        self.assertEqual(global_announcement.sender, self.user)
+
+        # 6. Course-specific Announcement can reference a Course.
+        course_announcement = Announcement.objects.create(
+            sender=self.user,
+            course=self.course,
+            title="Course Update",
+            content="New lesson added.",
+            is_published=True
+        )
+        self.assertEqual(course_announcement.title, "Course Update")
+        self.assertEqual(course_announcement.course, self.course)
+        self.assertIn(course_announcement, self.course.announcements.all())
+
+    def test_notification_ordering(self):
+        # 7. Notification ordering is newest first.
+        n1 = Notification.objects.create(recipient=self.user, title="First Notification", body="N1")
+        n2 = Notification.objects.create(recipient=self.user, title="Second Notification", body="N2")
+        n3 = Notification.objects.create(recipient=self.user, title="Third Notification", body="N3")
+
+        # Guarantee different created_at timestamps via update
+        now = timezone.now()
+        Notification.objects.filter(pk=n1.pk).update(created_at=now - timedelta(days=2))
+        Notification.objects.filter(pk=n2.pk).update(created_at=now - timedelta(days=1))
+        Notification.objects.filter(pk=n3.pk).update(created_at=now)
+
+        # Refresh from database because ordering in Meta applies to DB query
+        notifications = list(Notification.objects.filter(recipient=self.user))
+        self.assertEqual(notifications[0].title, "Third Notification")
+        self.assertEqual(notifications[1].title, "Second Notification")
+        self.assertEqual(notifications[2].title, "First Notification")
+
+    def test_announcement_ordering(self):
+        # 8. Announcement ordering is newest first.
+        a1 = Announcement.objects.create(title="First Announcement", content="A1")
+        a2 = Announcement.objects.create(title="Second Announcement", content="A2")
+        a3 = Announcement.objects.create(title="Third Announcement", content="A3")
+
+        # Guarantee different created_at timestamps via update
+        now = timezone.now()
+        Announcement.objects.filter(pk=a1.pk).update(created_at=now - timedelta(days=2))
+        Announcement.objects.filter(pk=a2.pk).update(created_at=now - timedelta(days=1))
+        Announcement.objects.filter(pk=a3.pk).update(created_at=now)
+
+        # Refresh from database because ordering in Meta applies to DB query
+        announcements = list(Announcement.objects.all())
+        self.assertEqual(announcements[0].title, "Third Announcement")
+        self.assertEqual(announcements[1].title, "Second Announcement")
+        self.assertEqual(announcements[2].title, "First Announcement")
+
+
+class NotificationAPITests(APITestCase):
+    def setUp(self):
+        # Users
+        self.student = User.objects.create_user(username="student", password="password123")
+        self.other_student = User.objects.create_user(username="other_student", password="password123")
+        self.staff_user = User.objects.create_user(username="staff", password="password123", is_staff=True)
+
+        # Courses
+        self.enrolled_course = Course.objects.create(title="Enrolled Course", price=10.00, is_published=True)
+        self.unenrolled_course = Course.objects.create(title="Unenrolled Course", price=20.00, is_published=True)
+
+        # Enroll student
+        self.enrollment = Enrollment.objects.create(user=self.student, course=self.enrolled_course)
+
+        # Pre-populate Notifications for student
+        self.notification_unread = Notification.objects.create(
+            recipient=self.student,
+            title="Unread Notif",
+            body="Notif body 1",
+            is_read=False
+        )
+        self.notification_read = Notification.objects.create(
+            recipient=self.student,
+            title="Read Notif",
+            body="Notif body 2",
+            is_read=True,
+            read_at=timezone.now() - timedelta(hours=1)
+        )
+
+        # Pre-populate Notification for other_student
+        self.other_notification = Notification.objects.create(
+            recipient=self.other_student,
+            title="Other Student Notif",
+            body="Notif body 3",
+            is_read=False
+        )
+
+    # ==========================================
+    # NOTIFICATIONS TESTS
+    # ==========================================
+
+    def test_authenticated_user_can_list_own_notifications(self):
+        # 1. Authenticated user can list own notifications.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('notification-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Should return both unread and read notification of student
+        self.assertEqual(len(response.data), 2)
+        titles = [n['title'] for n in response.data]
+        self.assertIn("Unread Notif", titles)
+        self.assertIn("Read Notif", titles)
+
+    def test_unauthenticated_user_cannot_list_notifications(self):
+        # 2. Unauthenticated user cannot list notifications.
+        url = reverse('notification-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_user_cannot_see_another_users_notifications(self):
+        # 3. User cannot see another user's notifications.
+        self.client.force_authenticate(user=self.student)
+        # Attempt to retrieve other student's notification via detail view
+        url = reverse('notification-detail', kwargs={'pk': self.other_notification.pk})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Attempt to list (other student's notification must not be in list)
+        list_url = reverse('notification-list')
+        list_response = self.client.get(list_url)
+        ids = [n['id'] for n in list_response.data]
+        self.assertNotIn(self.other_notification.pk, ids)
+
+    def test_unread_filtering_works(self):
+        # 4. Unread filtering works.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('notification-list')
+
+        # Filter ?is_read=false
+        response_unread = self.client.get(url, {'is_read': 'false'})
+        self.assertEqual(response_unread.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response_unread.data), 1)
+        self.assertEqual(response_unread.data[0]['title'], "Unread Notif")
+
+        # Filter ?is_read=true
+        response_read = self.client.get(url, {'is_read': 'true'})
+        self.assertEqual(response_read.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response_read.data), 1)
+        self.assertEqual(response_read.data[0]['title'], "Read Notif")
+
+    def test_user_can_mark_own_notification_as_read(self):
+        # 5. User can mark own notification as read.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('notification-mark-as-read', kwargs={'pk': self.notification_unread.pk})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['is_read'])
+        self.assertIsNotNone(response.data['read_at'])
+
+        # Verify DB is updated
+        self.notification_unread.refresh_from_db()
+        self.assertTrue(self.notification_unread.is_read)
+
+    def test_user_cannot_mark_another_users_notification_as_read(self):
+        # 6. User cannot mark another user's notification as read.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('notification-mark-as-read', kwargs={'pk': self.other_notification.pk})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_read_at_is_populated_when_marking_as_read(self):
+        # 7. read_at is populated when marking as read.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('notification-mark-as-read', kwargs={'pk': self.notification_unread.pk})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data['read_at'])
+
+    def test_already_read_notification_remains_safely_readable(self):
+        # 8. Already-read notification remains safely readable.
+        self.client.force_authenticate(user=self.student)
+        original_read_at = self.notification_read.read_at
+        url = reverse('notification-mark-as-read', kwargs={'pk': self.notification_read.pk})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.notification_read.refresh_from_db()
+        self.assertEqual(self.notification_read.read_at, original_read_at)
+
+    def test_mark_all_read_only_affects_authenticated_users_notifications(self):
+        # 9. Mark-all-read only affects the authenticated user's notifications.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('notification-mark-all-as-read')
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['updated'], 1)  # Only 1 unread notification of student
+
+        self.notification_unread.refresh_from_db()
+        self.assertTrue(self.notification_unread.is_read)
+
+        # Other student's notification remains unread
+        self.other_notification.refresh_from_db()
+        self.assertFalse(self.other_notification.is_read)
+
+    def test_unread_count_is_correct_and_user_specific(self):
+        # 10. Unread count is correct and user-specific.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('notification-unread-count')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 1)
+
+        # Check other student unread count
+        self.client.force_authenticate(user=self.other_student)
+        response_other = self.client.get(url)
+        self.assertEqual(response_other.data['count'], 1)
+
+    # ==========================================
+    # ANNOUNCEMENTS TESTS
+    # ==========================================
+
+    def test_authenticated_user_can_view_published_global_announcements(self):
+        # 11. Authenticated user can view published global announcements.
+        Announcement.objects.create(
+            sender=self.staff_user,
+            course=None,
+            title="Global Published",
+            content="Hello world",
+            is_published=True
+        )
+        self.client.force_authenticate(user=self.student)
+        url = reverse('announcement-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['title'], "Global Published")
+
+    def test_user_cannot_see_unpublished_announcements(self):
+        # 12. User cannot see unpublished announcements.
+        Announcement.objects.create(
+            sender=self.staff_user,
+            course=None,
+            title="Global Unpublished",
+            content="Secret info",
+            is_published=False
+        )
+        self.client.force_authenticate(user=self.student)
+        url = reverse('announcement-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
+    def test_user_can_see_published_announcements_for_courses_they_are_enrolled_in(self):
+        # 13. User can see published announcements for courses they are enrolled in.
+        Announcement.objects.create(
+            sender=self.staff_user,
+            course=self.enrolled_course,
+            title="Enrolled Course Notif",
+            content="Enrolled course is starting",
+            is_published=True
+        )
+        self.client.force_authenticate(user=self.student)
+        url = reverse('announcement-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['title'], "Enrolled Course Notif")
+
+    def test_user_cannot_see_announcements_for_unrelated_courses(self):
+        # 14. User cannot see announcements for unrelated courses.
+        Announcement.objects.create(
+            sender=self.staff_user,
+            course=self.unenrolled_course,
+            title="Unenrolled Course Notif",
+            content="Unrelated course is starting",
+            is_published=True
+        )
+        self.client.force_authenticate(user=self.student)
+        url = reverse('announcement-list')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
+    def test_staff_admin_can_create_announcements(self):
+        # 15. Staff/admin can create announcements.
+        self.client.force_authenticate(user=self.staff_user)
+        url = reverse('announcement-list')
+        payload = {
+            "title": "Staff Announcement",
+            "content": "Staff body text",
+            "course": self.enrolled_course.id,
+            "is_published": True
+        }
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['title'], "Staff Announcement")
+        self.assertEqual(response.data['sender'], self.staff_user.id)
+
+    def test_student_cannot_create_announcements(self):
+        # 16. Student cannot create announcements.
+        self.client.force_authenticate(user=self.student)
+        url = reverse('announcement-list')
+        payload = {
+            "title": "Student Announcement Attempt",
+            "content": "Fail text",
+            "is_published": True
+        }
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_sender_is_automatically_assigned_to_authenticated_staff_user(self):
+        # 17. Sender is automatically assigned to the authenticated staff user (client cannot spoof).
+        self.client.force_authenticate(user=self.staff_user)
+        url = reverse('announcement-list')
+        payload = {
+            "title": "Staff Spoof Attempt",
+            "content": "Check sender",
+            "sender": self.student.id,  # Client tries to set sender to student
+            "is_published": True
+        }
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        # Sender must be staff_user.id, not student.id
+        self.assertEqual(response.data['sender'], self.staff_user.id)
+
+    def test_staff_admin_can_update_announcements(self):
+        # 18. Staff/admin can update announcements.
+        ann = Announcement.objects.create(
+            sender=self.staff_user,
+            title="Initial Title",
+            content="Initial Content"
+        )
+        self.client.force_authenticate(user=self.staff_user)
+        url = reverse('announcement-detail', kwargs={'pk': ann.pk})
+        payload = {
+            "title": "Updated Title"
+        }
+        response = self.client.patch(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['title'], "Updated Title")
+
+    def test_staff_admin_can_delete_announcements(self):
+        # 19. Staff/admin can delete announcements.
+        ann = Announcement.objects.create(
+            sender=self.staff_user,
+            title="Delete Me",
+            content="Content"
+        )
+        self.client.force_authenticate(user=self.staff_user)
+        url = reverse('announcement-detail', kwargs={'pk': ann.pk})
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Announcement.objects.filter(pk=ann.pk).exists())
+
+    # ==========================================
+    # LMS SANITY TESTS
+    # ==========================================
+
+    def test_lms_functionality_remains_unaffected(self):
+        # Verify that Course, Module, VideoLesson, Enrollment, Purchase and LessonProgress query/creation works fine.
+        module = Module.objects.create(course=self.enrolled_course, title="Module 1", order=1)
+        lesson = VideoLesson.objects.create(module=module, title="Lesson 1", order=1)
+        progress = LessonProgress.objects.create(user=self.student, lesson=lesson, last_watched_position=1.0)
+        purchase = Purchase.objects.create(user=self.student, course=self.enrolled_course, amount=10.00, status="SUCCESS")
+
+        self.assertEqual(progress.lesson, lesson)
+        self.assertEqual(purchase.status, "SUCCESS")
+        self.assertEqual(self.enrollment.course, self.enrolled_course)
+
+
+class NotificationServiceTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="student_service", password="password123")
+        self.user2 = User.objects.create_user(username="other_student_service", password="password123")
+
+    def test_notification_created_via_service(self):
+        # 1. Notification can be created through the service.
+        notification, created = NotificationService.create_notification(
+            recipient=self.user,
+            title="Service Notification",
+            body="Created via NotificationService",
+            notification_type=NotificationType.ANNOUNCEMENT
+        )
+        self.assertTrue(created)
+        self.assertEqual(notification.title, "Service Notification")
+        self.assertEqual(notification.body, "Created via NotificationService")
+        self.assertEqual(notification.recipient, self.user)
+
+    def test_notification_with_idempotency_key(self):
+        # 2. Notification with an idempotency key is created successfully.
+        key = "idemp_key_1"
+        notification, created = NotificationService.create_notification(
+            recipient=self.user,
+            title="Idemp Notification",
+            body="Body text",
+            notification_type=NotificationType.PAYMENT,
+            idempotency_key=key
+        )
+        self.assertTrue(created)
+        self.assertEqual(notification.idempotency_key, key)
+
+    def test_duplicate_idempotency_key_does_not_create_duplicate(self):
+        # 3. Calling the service twice with the SAME idempotency key does not create a duplicate.
+        key = "duplicate_key"
+        notif1, created1 = NotificationService.create_notification(
+            recipient=self.user,
+            title="Title 1",
+            body="Body 1",
+            notification_type=NotificationType.ANNOUNCEMENT,
+            idempotency_key=key
+        )
+        notif2, created2 = NotificationService.create_notification(
+            recipient=self.user,
+            title="Title 2",
+            body="Body 2",
+            notification_type=NotificationType.PAYMENT,
+            idempotency_key=key
+        )
+        self.assertTrue(created1)
+        self.assertFalse(created2)
+        self.assertEqual(notif1, notif2)
+        self.assertEqual(notif2.title, "Title 1")
+        self.assertEqual(Notification.objects.filter(idempotency_key=key).count(), 1)
+
+    def test_same_recipient_different_idempotency_keys(self):
+        # 4. The same recipient can receive different notifications with different idempotency keys.
+        notif1, created1 = NotificationService.create_notification(
+            recipient=self.user,
+            title="Title A",
+            body="Body A",
+            notification_type=NotificationType.ENROLLMENT,
+            idempotency_key="key_a"
+        )
+        notif2, created2 = NotificationService.create_notification(
+            recipient=self.user,
+            title="Title B",
+            body="Body B",
+            notification_type=NotificationType.COURSE_UPDATE,
+            idempotency_key="key_b"
+        )
+        self.assertTrue(created1)
+        self.assertTrue(created2)
+        self.assertNotEqual(notif1, notif2)
+
+    def test_different_recipients_different_idempotency_keys(self):
+        # 5. Different recipients can use different idempotency keys safely.
+        notif1, created1 = NotificationService.create_notification(
+            recipient=self.user,
+            title="Title",
+            body="Body",
+            notification_type=NotificationType.ENROLLMENT,
+            idempotency_key="key_a"
+        )
+        notif2, created2 = NotificationService.create_notification(
+            recipient=self.user2,
+            title="Title",
+            body="Body",
+            notification_type=NotificationType.ENROLLMENT,
+            idempotency_key="key_b"
+        )
+        self.assertTrue(created1)
+        self.assertTrue(created2)
+        self.assertNotEqual(notif1, notif2)
+
+    def test_existing_notifications_with_null_idempotency_key_valid(self):
+        # 6. Existing notifications with NULL idempotency_key remain valid.
+        notif1 = Notification.objects.create(
+            recipient=self.user,
+            title="Null Key 1",
+            body="Body",
+            notification_type=NotificationType.ANNOUNCEMENT,
+            idempotency_key=None
+        )
+        notif2 = Notification.objects.create(
+            recipient=self.user,
+            title="Null Key 2",
+            body="Body",
+            notification_type=NotificationType.ANNOUNCEMENT,
+            idempotency_key=None
+        )
+        self.assertIsNone(notif1.idempotency_key)
+        self.assertIsNone(notif2.idempotency_key)
+
+    def test_simulated_concurrent_integrity_error(self):
+        # 8. Concurrent duplicate creation is handled safely.
+        key = "concurrency_key"
+        existing_notif = Notification.objects.create(
+            recipient=self.user,
+            title="Existing",
+            body="Body",
+            notification_type=NotificationType.ANNOUNCEMENT,
+            idempotency_key=key
+        )
+
+        from unittest.mock import patch
+        with patch('django.db.models.query.QuerySet.create', side_effect=IntegrityError("Mocked constraint violation")):
+            notif, created = NotificationService.create_notification(
+                recipient=self.user,
+                title="Concurrent Attempt",
+                body="Body",
+                notification_type=NotificationType.ANNOUNCEMENT,
+                idempotency_key=key
+            )
+
+            self.assertFalse(created)
+            self.assertEqual(notif, existing_notif)
+
+    def test_unexpected_database_errors_not_swallowed(self):
+        # 9. The service does not swallow unexpected database errors.
+        with self.assertRaises(IntegrityError):
+            NotificationService.create_notification(
+                recipient=None,
+                title="Invalid",
+                body="Invalid body",
+                notification_type=NotificationType.ANNOUNCEMENT
+            )
+
+
+class NotificationIntegrationTests(APITestCase):
+    def setUp(self):
+        self.student = User.objects.create_user(username="student_integration", password="password123")
+        self.student.is_student = True
+        self.student.save()
+
+        self.staff_user = User.objects.create_user(username="staff_integration", password="password123")
+        self.staff_user.is_superuser = True
+        self.staff_user.save()
+
+        self.course = Course.objects.create(title="Guitar 101", description="Learn Guitar", price=1000.00, is_published=True)
+
+    def test_pending_to_success_creates_payment_and_enrollment_notifications(self):
+        # Create pending purchase
+        purchase = Purchase.objects.create(
+            user=self.student,
+            course=self.course,
+            amount=1000.00,
+            status="PENDING",
+            razorpay_order_id="order_test_1"
+        )
+
+        # Verify transition
+        previous_status = purchase.status
+        purchase.status = "SUCCESS"
+        purchase.save()
+
+        # Trigger inside captured commit callback context
+        with self.captureOnCommitCallbacks(execute=True):
+            NotificationService.trigger_payment_success(purchase, previous_status)
+
+        # Check payment notification
+        pay_notif = Notification.objects.filter(
+            recipient=self.student,
+            notification_type="PAYMENT"
+        ).first()
+        self.assertIsNotNone(pay_notif)
+        self.assertEqual(pay_notif.title, "Payment successful")
+        self.assertIn("1000.0", pay_notif.body)
+        self.assertIn("Guitar 101", pay_notif.body)
+        self.assertEqual(pay_notif.action_url, "/dashboard")
+
+    def test_failed_to_success_creates_payment_notification(self):
+        purchase = Purchase.objects.create(
+            user=self.student,
+            course=self.course,
+            amount=1000.00,
+            status="FAILED",
+            razorpay_order_id="order_test_2"
+        )
+
+        previous_status = purchase.status
+        purchase.status = "SUCCESS"
+        purchase.save()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            NotificationService.trigger_payment_success(purchase, previous_status)
+
+        self.assertEqual(Notification.objects.filter(recipient=self.student, notification_type="PAYMENT").count(), 1)
+
+    def test_success_to_success_does_not_create_notification(self):
+        purchase = Purchase.objects.create(
+            user=self.student,
+            course=self.course,
+            amount=1000.00,
+            status="SUCCESS",
+            razorpay_order_id="order_test_3"
+        )
+
+        previous_status = purchase.status
+        purchase.status = "SUCCESS"
+        purchase.save()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            NotificationService.trigger_payment_success(purchase, previous_status)
+
+        self.assertEqual(Notification.objects.filter(recipient=self.student, notification_type="PAYMENT").count(), 0)
+
+    def test_two_notification_attempts_with_same_payment_idempotency_key(self):
+        purchase = Purchase.objects.create(
+            user=self.student,
+            course=self.course,
+            amount=1000.00,
+            status="PENDING",
+            razorpay_order_id="order_test_4"
+        )
+
+        # Simulate two calls with previous status PENDING
+        with self.captureOnCommitCallbacks(execute=True):
+            NotificationService.trigger_payment_success(purchase, "PENDING")
+        with self.captureOnCommitCallbacks(execute=True):
+            NotificationService.trigger_payment_success(purchase, "PENDING")
+
+        # Should create exactly 1 due to idempotency uniqueness
+        self.assertEqual(
+            Notification.objects.filter(
+                idempotency_key=f"payment:{purchase.id}:success"
+            ).count(),
+            1
+        )
+
+    def test_enrollment_creation_triggers_notification(self):
+        # Test enrollment creation signal
+        with self.captureOnCommitCallbacks(execute=True):
+            enrollment = Enrollment.objects.create(user=self.student, course=self.course)
+
+        # Retrieve enrollment notification
+        enroll_notif = Notification.objects.filter(
+            recipient=self.student,
+            notification_type="ENROLLMENT"
+        ).first()
+        self.assertIsNotNone(enroll_notif)
+        self.assertEqual(enroll_notif.title, "You're enrolled!")
+        self.assertIn("Guitar 101", enroll_notif.body)
+        self.assertEqual(enroll_notif.action_url, f"/courses/{self.course.id}/learn")
+
+    def test_enrollment_update_does_not_trigger_notification(self):
+        # Create enrollment
+        with self.captureOnCommitCallbacks(execute=True):
+            enrollment = Enrollment.objects.create(user=self.student, course=self.course)
+
+        # Clear existing notifications
+        Notification.objects.all().delete()
+
+        # Update enrollment
+        enrollment.enrolled_at = timezone.now()
+        with self.captureOnCommitCallbacks(execute=True):
+            enrollment.save()
+
+        # Check that no new notifications are created
+        self.assertEqual(Notification.objects.count(), 0)
+
+    def test_uniqueness_prevents_duplicate_enrollment_notification(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            enrollment = Enrollment.objects.create(user=self.student, course=self.course)
+
+        # Call signal manually on existing instance with created=True again
+        from django.db.models.signals import post_save
+        from .signals import enrollment_created_signal
+
+        with self.captureOnCommitCallbacks(execute=True):
+            enrollment_created_signal(sender=Enrollment, instance=enrollment, created=True)
+
+        # Verify count is 1
+        self.assertEqual(
+            Notification.objects.filter(
+                idempotency_key=f"enrollment:{enrollment.id}:created"
+            ).count(),
+            1
+        )
+
+    def test_notification_failure_does_not_affect_payment_or_enrollment(self):
+        from unittest.mock import patch
+
+        with patch('notifications.services.NotificationService.create_notification', side_effect=Exception("Database down")):
+            # Simulate a payment verification success transition
+            purchase = Purchase.objects.create(
+                user=self.student,
+                course=self.course,
+                amount=1000.00,
+                status="PENDING",
+                razorpay_order_id="order_test_5"
+            )
+            previous_status = purchase.status
+            purchase.status = "SUCCESS"
+            purchase.save()
+
+            # This should NOT crash the view/transaction
+            with self.captureOnCommitCallbacks(execute=True):
+                NotificationService.trigger_payment_success(purchase, previous_status)
+            self.assertEqual(purchase.status, "SUCCESS")
+
+            with self.captureOnCommitCallbacks(execute=True):
+                enrollment = Enrollment.objects.create(user=self.student, course=self.course)
+            self.assertEqual(enrollment.user, self.student)
+
+
+class DeviceTokenAPITests(APITestCase):
+    """
+    Phase 4.10: registration-only push-token endpoint. Deliberately does
+    NOT test any actual push delivery -- there is none yet (see
+    DeviceToken's own model docstring for why that's a separate phase).
+    """
+    def setUp(self):
+        self.student = User.objects.create_user(username="devtoken_student", password="password123")
+        self.other_student = User.objects.create_user(username="devtoken_other", password="password123")
+        self.url = reverse('device-token')
+
+    def test_unauthenticated_cannot_register(self):
+        response = self.client.post(self.url, {"token": "ExponentPushToken[abc]", "platform": "ANDROID"})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_register_creates_device_token(self):
+        self.client.force_authenticate(user=self.student)
+        response = self.client.post(self.url, {"token": "ExponentPushToken[abc]", "platform": "ANDROID"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        token = DeviceToken.objects.get(token="ExponentPushToken[abc]")
+        self.assertEqual(token.user, self.student)
+        self.assertEqual(token.platform, "ANDROID")
+        self.assertTrue(token.is_active)
+
+    def test_missing_token_rejected(self):
+        self.client.force_authenticate(user=self.student)
+        response = self.client.post(self.url, {"platform": "ANDROID"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_platform_rejected(self):
+        self.client.force_authenticate(user=self.student)
+        response = self.client.post(self.url, {"token": "ExponentPushToken[abc]", "platform": "WINDOWS_PHONE"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(DeviceToken.objects.exists())
+
+    def test_reregistering_same_token_updates_not_duplicates(self):
+        self.client.force_authenticate(user=self.student)
+        self.client.post(self.url, {"token": "ExponentPushToken[abc]", "platform": "ANDROID"})
+        self.client.post(self.url, {"token": "ExponentPushToken[abc]", "platform": "ANDROID"})
+        self.assertEqual(DeviceToken.objects.filter(token="ExponentPushToken[abc]").count(), 1)
+
+    def test_token_moving_to_a_different_user_reassigns_ownership(self):
+        # Same physical device, a different student logs in -- the token
+        # is reassigned, not duplicated (see DeviceToken's own docstring).
+        self.client.force_authenticate(user=self.student)
+        self.client.post(self.url, {"token": "ExponentPushToken[shared]", "platform": "ANDROID"})
+
+        self.client.force_authenticate(user=self.other_student)
+        self.client.post(self.url, {"token": "ExponentPushToken[shared]", "platform": "ANDROID"})
+
+        self.assertEqual(DeviceToken.objects.filter(token="ExponentPushToken[shared]").count(), 1)
+        token = DeviceToken.objects.get(token="ExponentPushToken[shared]")
+        self.assertEqual(token.user, self.other_student)
+
+    def test_delete_deactivates_own_token(self):
+        self.client.force_authenticate(user=self.student)
+        self.client.post(self.url, {"token": "ExponentPushToken[abc]", "platform": "ANDROID"})
+        response = self.client.delete(self.url, {"token": "ExponentPushToken[abc]"}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        token = DeviceToken.objects.get(token="ExponentPushToken[abc]")
+        self.assertFalse(token.is_active)
+
+    def test_cannot_deactivate_another_users_token(self):
+        self.client.force_authenticate(user=self.student)
+        self.client.post(self.url, {"token": "ExponentPushToken[abc]", "platform": "ANDROID"})
+
+        self.client.force_authenticate(user=self.other_student)
+        self.client.delete(self.url, {"token": "ExponentPushToken[abc]"}, format='json')
+
+        token = DeviceToken.objects.get(token="ExponentPushToken[abc]")
+        self.assertTrue(token.is_active)  # untouched -- silently scoped away, not an error

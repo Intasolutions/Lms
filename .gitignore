@@ -1,0 +1,32 @@
+node_modules/
+.next/
+dist/
+build/
+.env
+.env.local
+.DS_Store
+
+__pycache__/
+*.pyc
+venv/
+env/
+.venv/
+db.sqlite3
+media/
+static/
+
+# Stray extracted deployment artifacts -- never part of the real app source.
+test_zip_extract/
+*-release.zip
+deploy-manual.zip
+*.apk
+*.aab
+
+# Local tooling / pulled EB server logs / Expo bundle-log exports -- none
+# of these are application source, and EB/Expo logs specifically can
+# contain runtime request details that don't belong in version control.
+.claude/
+BundleLogs-*/
+BundleLogs-*.zip
+Newlog/
+log/
